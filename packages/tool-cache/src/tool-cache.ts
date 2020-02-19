@@ -3,9 +3,9 @@ import * as io from '@actions/io'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import * as httpm from 'typed-rest-client/HttpClient'
+import * as httpm from '@actions/http-client'
 import * as semver from 'semver'
-import * as uuidV4 from 'uuid/v4'
+import uuidV4 from 'uuid/v4'
 import {exec} from '@actions/exec/lib/exec'
 import {ExecOptions} from '@actions/exec/lib/interfaces'
 import {ok} from 'assert'
@@ -48,9 +48,13 @@ if (!tempDirectory || !cacheRoot) {
  * Download a tool from an url and stream it into a file
  *
  * @param url       url of tool to download
+ * @param dest      path to download tool
  * @returns         path to downloaded tool
  */
-export async function downloadTool(url: string): Promise<string> {
+export async function downloadTool(
+  url: string,
+  dest?: string
+): Promise<string> {
   // Wrap in a promise so that we can resolve from within stream callbacks
   return new Promise<string>(async (resolve, reject) => {
     try {
@@ -58,14 +62,13 @@ export async function downloadTool(url: string): Promise<string> {
         allowRetries: true,
         maxRetries: 3
       })
-      const destPath = path.join(tempDirectory, uuidV4())
-
-      await io.mkdirP(tempDirectory)
+      dest = dest || path.join(tempDirectory, uuidV4())
+      await io.mkdirP(path.dirname(dest))
       core.debug(`Downloading ${url}`)
-      core.debug(`Downloading ${destPath}`)
+      core.debug(`Downloading ${dest}`)
 
-      if (fs.existsSync(destPath)) {
-        throw new Error(`Destination file path ${destPath} already exists`)
+      if (fs.existsSync(dest)) {
+        throw new Error(`Destination file path ${dest} already exists`)
       }
 
       const response: httpm.HttpClientResponse = await http.get(url)
@@ -73,26 +76,22 @@ export async function downloadTool(url: string): Promise<string> {
       if (response.message.statusCode !== 200) {
         const err = new HTTPError(response.message.statusCode)
         core.debug(
-          `Failed to download from "${url}". Code(${
-            response.message.statusCode
-          }) Message(${response.message.statusMessage})`
+          `Failed to download from "${url}". Code(${response.message.statusCode}) Message(${response.message.statusMessage})`
         )
         throw err
       }
 
-      const file: NodeJS.WritableStream = fs.createWriteStream(destPath)
+      const file: NodeJS.WritableStream = fs.createWriteStream(dest)
       file.on('open', async () => {
         try {
           const stream = response.message.pipe(file)
           stream.on('close', () => {
             core.debug('download complete')
-            resolve(destPath)
+            resolve(dest)
           })
         } catch (err) {
           core.debug(
-            `Failed to download from "${url}". Code(${
-              response.message.statusCode
-            }) Message(${response.message.statusMessage})`
+            `Failed to download from "${url}". Code(${response.message.statusCode}) Message(${response.message.statusMessage})`
           )
           reject(err)
         }
@@ -130,7 +129,7 @@ export async function extract7z(
   ok(IS_WINDOWS, 'extract7z() not supported on current OS')
   ok(file, 'parameter "file" is required')
 
-  dest = dest || (await _createExtractFolder(dest))
+  dest = await _createExtractFolder(dest)
 
   const originalCwd = process.cwd()
   process.chdir(dest)
@@ -183,11 +182,11 @@ export async function extract7z(
 }
 
 /**
- * Extract a tar
+ * Extract a compressed tar archive
  *
  * @param file     path to the tar
  * @param dest     destination directory. Optional.
- * @param flags    flags for the tar. Optional.
+ * @param flags    flags for the tar command to use for extraction. Defaults to 'xz' (extracting gzipped tars). Optional.
  * @returns        path to the destination directory
  */
 export async function extractTar(
@@ -199,9 +198,44 @@ export async function extractTar(
     throw new Error("parameter 'file' is required")
   }
 
-  dest = dest || (await _createExtractFolder(dest))
-  const tarPath: string = await io.which('tar', true)
-  await exec(`"${tarPath}"`, [flags, '-C', dest, '-f', file])
+  // Create dest
+  dest = await _createExtractFolder(dest)
+
+  // Determine whether GNU tar
+  core.debug('Checking tar --version')
+  let versionOutput = ''
+  await exec('tar --version', [], {
+    ignoreReturnCode: true,
+    silent: true,
+    listeners: {
+      stdout: (data: Buffer) => (versionOutput += data.toString()),
+      stderr: (data: Buffer) => (versionOutput += data.toString())
+    }
+  })
+  core.debug(versionOutput.trim())
+  const isGnuTar = versionOutput.toUpperCase().includes('GNU TAR')
+
+  // Initialize args
+  const args = [flags]
+
+  let destArg = dest
+  let fileArg = file
+  if (IS_WINDOWS && isGnuTar) {
+    args.push('--force-local')
+    destArg = dest.replace(/\\/g, '/')
+
+    // Technically only the dest needs to have `/` but for aesthetic consistency
+    // convert slashes in the file arg too.
+    fileArg = file.replace(/\\/g, '/')
+  }
+
+  if (isGnuTar) {
+    // Suppress warnings when using GNU tar to extract archives created by BSD tar
+    args.push('--warning=no-unknown-keyword')
+  }
+
+  args.push('-C', destArg, '-f', fileArg)
+  await exec(`tar`, args)
 
   return dest
 }
@@ -218,16 +252,12 @@ export async function extractZip(file: string, dest?: string): Promise<string> {
     throw new Error("parameter 'file' is required")
   }
 
-  dest = dest || (await _createExtractFolder(dest))
+  dest = await _createExtractFolder(dest)
 
   if (IS_WINDOWS) {
     await extractZipWin(file, dest)
   } else {
-    if (process.platform === 'darwin') {
-      await extractZipDarwin(file, dest)
-    } else {
-      await extractZipNix(file, dest)
-    }
+    await extractZipNix(file, dest)
   }
 
   return dest
@@ -255,18 +285,7 @@ async function extractZipWin(file: string, dest: string): Promise<void> {
 }
 
 async function extractZipNix(file: string, dest: string): Promise<void> {
-  const unzipPath = path.join(__dirname, '..', 'scripts', 'externals', 'unzip')
-  await exec(`"${unzipPath}"`, [file], {cwd: dest})
-}
-
-async function extractZipDarwin(file: string, dest: string): Promise<void> {
-  const unzipPath = path.join(
-    __dirname,
-    '..',
-    'scripts',
-    'externals',
-    'unzip-darwin'
-  )
+  const unzipPath = await io.which('unzip')
   await exec(`"${unzipPath}"`, [file], {cwd: dest})
 }
 
